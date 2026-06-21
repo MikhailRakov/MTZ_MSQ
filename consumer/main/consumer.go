@@ -263,8 +263,15 @@ func main() {
 	}
 	log.Println("S3 client initialized successfully.")
 
-	conn, err := amqp.Dial("amqp://guest:guest@10.42.0.65:5672/")
-	failOnError(err, "Failed to connect to RabbitMQ")
+	rabbitURL := os.Getenv("RABBITMQ_URL")
+	if rabbitURL == "" {
+		rabbitURL = "amqp://guest:guest@10.42.0.65:5672/" // fallback
+	}
+
+	conn, err := amqp.Dial(rabbitURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+	}
 	defer conn.Close()
 
 	ch, err := conn.Channel()
