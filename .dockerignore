@@ -1,0 +1,18 @@
+# .dockerignore
+.git
+.vscode
+.idea
+*.log
+*.dat
+*.zip
+*.vtr
+*.so
+__pycache__
+venv/
+.env
+Dockerfile*
+docker-compose*
+AP3DMT_app/
+build/
+logs/
+data/
