@@ -15,7 +15,7 @@ env:
 jobs:
   # 1. Сборка образа
   build-and-push:
-    runs-on: self-hosted
+    runs-on: [self-hosted, mtz]
     permissions:
       contents: read
       packages: write
