@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/mtz-consumer
+  IMAGE_NAME: mikhailrakov/mtz_msq/mtz-consumer
 
 jobs:
   # 1. Сборка образа
