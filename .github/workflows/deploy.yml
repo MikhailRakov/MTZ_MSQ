@@ -13,7 +13,6 @@ env:
   IMAGE_NAME: mikhailrakov/mtz_msq/mtz-consumer
 
 jobs:
-  # 1. Сборка образа — на GitHub runner (ubuntu-latest)
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
@@ -43,10 +42,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # 2. Деплой — на self-hosted runner (на вашем сервере!)
   deploy:
     needs: build-and-push
-    runs-on: self-hosted  # ← КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: используем ваш сервер
+    runs-on: self-hosted
     steps:
       - name: Deploy locally
         run: |
