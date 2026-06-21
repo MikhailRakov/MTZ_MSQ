@@ -51,6 +51,7 @@ jobs:
           set -e
           
           echo "🔐 Создание .env файла..."
+          mkdir -p /opt/mtz
           cat > /opt/mtz/.env <<EOF
           AWS_S3_ENDPOINT=${{ secrets.AWS_S3_ENDPOINT }}
           AWS_S3_REGION=${{ secrets.AWS_S3_REGION }}
@@ -62,16 +63,16 @@ jobs:
           chmod 600 /opt/mtz/.env
           
           echo "🔑 Логин в GHCR..."
-          echo "${{ secrets.GITHUB_TOKEN }}" | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           
           echo "📥 Загрузка образа..."
-          sudo docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           
           echo "🧹 Остановка старого контейнера..."
-          sudo docker rm -f mtz-consumer 2>/dev/null || true
+          docker rm -f mtz-consumer 2>/dev/null || true
           
           echo "🚀 Запуск нового контейнера..."
-          sudo docker run -d --name mtz-consumer \
+          docker run -d --name mtz-consumer \
             --env-file /opt/mtz/.env \
             -e MCR_PATH=/opt/matlab \
             -e APP_DIR=/app/AP3DMT_app/application \
@@ -83,4 +84,4 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           
           echo "✅ Деплой завершён!"
-          sudo docker ps | grep mtz-consumer
+          docker ps | grep mtz-consumer
