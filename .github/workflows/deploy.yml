@@ -76,7 +76,7 @@ jobs:
             --env-file /opt/mtz/.env \
             -e MCR_PATH=/opt/matlab \
             -e APP_DIR=/app/AP3DMT_app/application \
-            -v /opt/matlab:/opt/matlab:ro \
+            -v /opt/matlab/R2025b:/opt/matlab:ro \
             -v /opt/mtz/application:/app/AP3DMT_app/application \
             -v /opt/mtz/logs:/app/logs \
             --network host \
