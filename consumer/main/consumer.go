@@ -299,7 +299,7 @@ func main() {
 	)
 	failOnError(err, "Failed to register a consumer")
 
-	var forever chan struct{}
+	var forever = make(chan struct{})
 
 	go func() {
 		for d := range msgs {
@@ -405,5 +405,6 @@ func main() {
 	}()
 
 	log.Printf(" [*] Waiting for messages. To exit press CTRL+C")
+
 	<-forever
 }
