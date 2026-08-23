@@ -67,10 +67,11 @@ func initS3Client() (*s3.Client, error) {
 	// Создаем провайдер учетных данных
 	credsProvider := credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, "")
 
-	// Загружаем конфигурацию
+	// Загружаем конфигурацию с увеличенными таймаутами
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithRegion(region),
 		config.WithCredentialsProvider(credsProvider),
+		config.WithRetryMaxAttempts(5), // Увеличиваем количество попыток с 3 до 5
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
@@ -133,6 +134,16 @@ func uploadFileToS3(s3Client *s3.Client, bucketName, localFilePath, s3Key string
 	}
 	defer file.Close()
 
+	// Получаем размер файла для логирования
+	fileInfo, err := file.Stat()
+	if err == nil {
+		log.Printf("[UPLOAD] File size: %.2f MB", float64(fileInfo.Size())/(1024*1024))
+	}
+
+	// Создаем контекст с таймаутом 10 минут для больших файлов
+	ctx, cancel := context.WithTimeout(context.Background(), 10*60*1000000000) // 10 минут в наносекундах
+	defer cancel()
+
 	putObjectInput := &s3.PutObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(s3Key),
@@ -140,7 +151,8 @@ func uploadFileToS3(s3Client *s3.Client, bucketName, localFilePath, s3Key string
 		// ACL:  types.ObjectCannedACL("private"), // Установите ACL по необходимости
 	}
 
-	_, err = s3Client.PutObject(context.TODO(), putObjectInput)
+	log.Printf("[UPLOAD] Starting upload to S3...")
+	_, err = s3Client.PutObject(ctx, putObjectInput)
 	if err != nil {
 		return fmt.Errorf("failed to upload file to S3: %w", err)
 	}
