@@ -418,6 +418,27 @@ func main() {
 			if ext == ".zip" {
 				log.Printf("Detected ZIP archive: %s. Extracting to: %s", localFilePath, downloadDir)
 
+				// Очистка старых файлов перед распаковкой
+				log.Printf("[CLEANUP] Removing old files from previous runs")
+				filesToClean := []string{
+					"all_models.zip",
+					"Nlcg Log File.dat",
+					"Output LogFile.dat",
+					"result.vtr",
+					"model.vtm",
+				}
+				for _, fname := range filesToClean {
+					oldPath := filepath.Join(downloadDir, fname)
+					if err := os.Remove(oldPath); err == nil {
+						log.Printf("[CLEANUP] Removed old file: %s", fname)
+					}
+				}
+				// Очистка директории Out_Output
+				outDir := filepath.Join(downloadDir, "Out_Output")
+				if err := os.RemoveAll(outDir); err == nil {
+					log.Printf("[CLEANUP] Removed old output directory: Out_Output")
+				}
+
 				// Распаковываем файлы прямо в downloadDir (AP3DMT_app/application)
 				if err := unzipToFlatDir(localFilePath, downloadDir); err != nil {
 					log.Printf("Failed to unzip file %s: %v", localFilePath, err)
