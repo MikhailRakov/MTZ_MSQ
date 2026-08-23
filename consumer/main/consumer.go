@@ -168,14 +168,80 @@ func call_solve() error {
 		appDir = "/app/AP3DMT_app/application"
 	}
 
+	// Диагностика: проверка окружения перед запуском
+	log.Printf("[DIAGNOSTICS] MCR_PATH: %s", mcrPath)
+	log.Printf("[DIAGNOSTICS] APP_DIR: %s", appDir)
+	log.Printf("[DIAGNOSTICS] LD_LIBRARY_PATH: %s", os.Getenv("LD_LIBRARY_PATH"))
+	log.Printf("[DIAGNOSTICS] MCR_CACHE_ROOT: %s", os.Getenv("MCR_CACHE_ROOT"))
+
+	// Проверка существования MCR
+	if _, err := os.Stat(mcrPath); os.IsNotExist(err) {
+		return fmt.Errorf("MCR_PATH does not exist: %s", mcrPath)
+	}
+	log.Printf("[DIAGNOSTICS] MCR directory exists: %s", mcrPath)
+
+	// Проверка существования рабочей директории
+	if _, err := os.Stat(appDir); os.IsNotExist(err) {
+		return fmt.Errorf("APP_DIR does not exist: %s", appDir)
+	}
+	log.Printf("[DIAGNOSTICS] APP_DIR exists: %s", appDir)
+
+	// Проверка существования скрипта запуска
+	scriptPath := filepath.Join(appDir, "run_AP3DMT_comp.sh")
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		return fmt.Errorf("run_AP3DMT_comp.sh not found at: %s", scriptPath)
+	}
+	log.Printf("[DIAGNOSTICS] Script found: %s", scriptPath)
+
+	// Проверка прав на выполнение
+	info, err := os.Stat(scriptPath)
+	if err == nil {
+		log.Printf("[DIAGNOSTICS] Script permissions: %s", info.Mode())
+	}
+
+	// Список файлов в APP_DIR для отладки
+	files, err := os.ReadDir(appDir)
+	if err == nil {
+		log.Printf("[DIAGNOSTICS] Files in APP_DIR (%d total):", len(files))
+		for i, f := range files {
+			if i < 20 { // ограничиваем вывод первыми 20 файлами
+				log.Printf("  - %s (dir: %v)", f.Name(), f.IsDir())
+			}
+		}
+		if len(files) > 20 {
+			log.Printf("  ... and %d more files", len(files)-20)
+		}
+	}
+
+	// Проверка наличия входных данных (solution_data.zip или распакованных файлов)
+	dataFiles := []string{"solution_data.zip", "AP3DMT.dat", "input.dat", "data.dat"}
+	foundData := false
+	for _, df := range dataFiles {
+		if _, err := os.Stat(filepath.Join(appDir, df)); err == nil {
+			log.Printf("[DIAGNOSTICS] Found data file: %s", df)
+			foundData = true
+		}
+	}
+	if !foundData {
+		log.Printf("[WARNING] No expected data files found in APP_DIR")
+	}
+
 	cmd := exec.Command("./run_AP3DMT_comp.sh", mcrPath)
 	cmd.Dir = appDir
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	err := cmd.Run()
+	log.Printf("[DIAGNOSTICS] Executing command: %s %s", cmd.Path, cmd.Args)
+	log.Printf("[DIAGNOSTICS] Working directory: %s", cmd.Dir)
+
+	err = cmd.Run()
 	if err != nil {
+		// Детальная информация об ошибке
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			log.Printf("[ERROR] AP3DMT exit code: %d", exitErr.ExitCode())
+			log.Printf("[ERROR] AP3DMT exit error: %v", exitErr)
+		}
 		log.Printf("AP3DMT application finished with error: %v", err)
 		return fmt.Errorf("AP3DMT execution failed: %w", err)
 	}
@@ -343,6 +409,11 @@ func main() {
 
 			log.Printf("Successfully downloaded file: %s", localFilePath)
 
+			// Проверка размера скачанного файла
+			if fileInfo, err := os.Stat(localFilePath); err == nil {
+				log.Printf("[DIAGNOSTICS] Downloaded file size: %d bytes", fileInfo.Size())
+			}
+
 			ext := strings.ToLower(filepath.Ext(localFilePath))
 			if ext == ".zip" {
 				log.Printf("Detected ZIP archive: %s. Extracting to: %s", localFilePath, downloadDir)
@@ -354,15 +425,36 @@ func main() {
 				}
 				log.Printf("Successfully extracted archive contents to: %s", downloadDir)
 
+				// Список файлов после распаковки
+				extractedFiles, _ := os.ReadDir(downloadDir)
+				log.Printf("[DIAGNOSTICS] Files after extraction (%d total):", len(extractedFiles))
+				for i, f := range extractedFiles {
+					if i < 15 {
+						fInfo, _ := f.Info()
+						size := int64(0)
+						if fInfo != nil {
+							size = fInfo.Size()
+						}
+						log.Printf("  - %s (size: %d bytes)", f.Name(), size)
+					}
+				}
+				if len(extractedFiles) > 15 {
+					log.Printf("  ... and %d more files", len(extractedFiles)-15)
+				}
+
 				// Опционально: удалить архив после распаковки, чтобы не занимать место
 				os.Remove(localFilePath)
+			} else {
+				log.Printf("[INFO] File is not a ZIP archive, extension: %s", ext)
 			}
 
 			// 7. Запустить внешнюю программу AP3DMT
+			log.Printf("[STAGE] Starting AP3DMT execution for user: %s, solution: %s", message.UserID, message.SolutionID)
 			if err := call_solve(); err != nil {
 				log.Printf("AP3DMT execution failed for file %s. Skipping further processing. Error: %v", localFilePath, err)
 				continue // Пропускаем дальнейшую обработку, если AP3DMT завершился с ошибкой
 			}
+			log.Printf("[STAGE] AP3DMT execution completed successfully")
 
 			// 8. Запустить Python-скрипт (через venv)
 			if err := runPythonScript(); err != nil {
