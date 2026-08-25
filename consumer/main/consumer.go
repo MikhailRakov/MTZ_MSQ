@@ -3,6 +3,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -29,6 +31,7 @@ import (
 type QueueMessage struct {
 	UserID           string `json:"user_id"`
 	SolutionID       string `json:"solution_id"`
+	TaskID           string `json:"task_id,omitempty"`
 	S3FileKey        string `json:"s3_file_key"`
 	OriginalFilename string `json:"original_filename,omitempty"`
 	Timestamp        int64  `json:"timestamp"`
@@ -383,6 +386,226 @@ func unzipToFlatDir(src string, dest string) error {
 	return nil
 }
 
+// --- Публикация статуса выполнения в S3 ---
+
+// Этапы обработки решения. Значение попадает в поле stage файла status.json
+// и предназначено для отображения на основном сервере.
+const (
+	stageValidating  = "validating"
+	stageDownloading = "downloading"
+	stageExtracting  = "extracting"
+	stageComputing   = "computing"
+	stageConverting  = "converting"
+	stageUploading   = "uploading"
+	stageCompleted   = "completed"
+)
+
+// stageOrder задаёт номер этапа для отрисовки прогресса на основном сервере.
+// Терминальных этапов (completed/failed) в списке нет: у них номер равен общему
+// числу этапов, то есть шкала заполнена.
+var stageOrder = map[string]int{
+	stageDownloading: 1,
+	stageExtracting:  2,
+	stageComputing:   3,
+	stageConverting:  4,
+	stageUploading:   5,
+}
+
+// stageTotal — общее число рабочих этапов, знаменатель шкалы прогресса
+const stageTotal = 5
+
+// Состояния решения в поле status файла status.json
+const (
+	statusRunning   = "running"
+	statusCompleted = "completed"
+	statusFailed    = "failed"
+)
+
+// heartbeatInterval — период перезаписи status.json во время длительных этапов.
+// Расчёт AP3DMT идёт часами; без периодического обновления updated_at основной
+// сервер не отличит идущий расчёт от упавшего потребителя.
+const heartbeatInterval = 30 * time.Second
+
+// statusTimeout ограничивает публикацию статуса: это вспомогательная операция,
+// она не должна задерживать конвейер при недоступности S3.
+const statusTimeout = 30 * time.Second
+
+// SolutionStatus — содержимое status.json, читаемое основным сервером
+type SolutionStatus struct {
+	UserID     string `json:"user_id"`
+	SolutionID string `json:"solution_id"`
+	TaskID     string `json:"task_id,omitempty"`
+	Stage      string `json:"stage"`
+	StageIndex int    `json:"stage_index"`
+	StageTotal int    `json:"stage_total"`
+	Status     string `json:"status"`
+	Message    string `json:"message,omitempty"`
+	Error      string `json:"error,omitempty"`
+	// WillRetry сообщает основному серверу, ждать ли повторной попытки
+	// или показывать пользователю окончательную ошибку
+	WillRetry bool   `json:"will_retry"`
+	ResultKey string `json:"result_key,omitempty"`
+	StartedAt string `json:"started_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// statusReporter публикует текущий этап обработки в S3.
+// Все ошибки публикации только логируются: сбой отчёта о статусе не должен
+// ронять сам расчёт.
+type statusReporter struct {
+	s3Client   *s3.Client
+	bucketName string
+	key        string
+	startedAt  time.Time
+
+	mu      sync.Mutex
+	current SolutionStatus
+
+	// stopHeartbeat останавливает фоновое обновление updated_at
+	stopHeartbeat chan struct{}
+	heartbeatDone chan struct{}
+}
+
+// statusKey возвращает ключ файла статуса рядом с результатами решения
+func statusKey(userID, solutionID string) string {
+	return fmt.Sprintf("users/%s/solutions/%s/status.json", userID, solutionID)
+}
+
+func newStatusReporter(s3Client *s3.Client, bucketName string, msg QueueMessage) *statusReporter {
+	now := time.Now().UTC()
+	return &statusReporter{
+		s3Client:   s3Client,
+		bucketName: bucketName,
+		key:        statusKey(msg.UserID, msg.SolutionID),
+		startedAt:  now,
+		current: SolutionStatus{
+			UserID:     msg.UserID,
+			SolutionID: msg.SolutionID,
+			TaskID:     msg.TaskID,
+			// Начальный этап: если сообщение не пройдёт проверку полей,
+			// в status.json попадёт stage=validating, а не пустая строка
+			Stage:      stageValidating,
+			StageTotal: stageTotal,
+			Status:     statusRunning,
+			StartedAt:  now.Format(time.RFC3339),
+		},
+	}
+}
+
+// publish записывает текущее состояние в S3 (вызывается под удержанным mu)
+func (r *statusReporter) publish() {
+	r.current.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+
+	payload, err := json.MarshalIndent(r.current, "", "  ")
+	if err != nil {
+		log.Printf("[STATUS] Failed to marshal status: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
+	defer cancel()
+
+	_, err = r.s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(r.bucketName),
+		Key:         aws.String(r.key),
+		Body:        bytes.NewReader(payload),
+		ContentType: aws.String("application/json"),
+		// Статус читается опросом, поэтому запрещаем кэширование промежуточными узлами
+		CacheControl: aws.String("no-cache"),
+	})
+	if err != nil {
+		log.Printf("[STATUS] Failed to publish status to %s: %v", r.key, err)
+		return
+	}
+	log.Printf("[STATUS] %s -> stage=%s status=%s", r.key, r.current.Stage, r.current.Status)
+}
+
+// setStage публикует переход к новому этапу
+func (r *statusReporter) setStage(stage, message string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.current.Stage = stage
+	r.current.StageIndex = stageOrder[stage]
+	r.current.Status = statusRunning
+	r.current.Message = message
+	r.current.Error = ""
+	r.publish()
+}
+
+// complete публикует успешное завершение со ссылкой на результат
+func (r *statusReporter) complete(resultKey string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.current.Stage = stageCompleted
+	r.current.StageIndex = stageTotal
+	r.current.Status = statusCompleted
+	r.current.Message = "Расчёт завершён, результат загружен"
+	r.current.Error = ""
+	r.current.ResultKey = resultKey
+	r.publish()
+}
+
+// fail публикует ошибку. willRetry сообщает, будет ли сообщение обработано повторно.
+func (r *statusReporter) fail(err error, willRetry bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Этап (stage) не перезаписываем: по нему видно, на чём именно всё упало.
+	// Терминальность отражена в поле status.
+	r.current.Status = statusFailed
+	r.current.Error = err.Error()
+	r.current.WillRetry = willRetry
+	if willRetry {
+		r.current.Message = "Временный сбой, задача будет повторена"
+	} else {
+		r.current.Message = "Обработка завершилась ошибкой"
+	}
+	r.publish()
+}
+
+// startHeartbeat периодически перезаписывает status.json во время длительного этапа,
+// обновляя updated_at. Основной сервер по устареванию updated_at определяет,
+// что потребитель умер, не дойдя до терминального статуса.
+func (r *statusReporter) startHeartbeat() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	r.stopHeartbeat = stop
+	r.heartbeatDone = done
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				r.mu.Lock()
+				// Терминальное состояние могло наступить между тиками —
+				// не затираем completed/failed повторной публикацией running
+				if r.current.Status == statusRunning {
+					r.publish()
+				}
+				r.mu.Unlock()
+			}
+		}
+	}()
+}
+
+// stop останавливает фоновое обновление и дожидается завершения горутины
+func (r *statusReporter) stop() {
+	if r.stopHeartbeat == nil {
+		return
+	}
+	close(r.stopHeartbeat)
+	<-r.heartbeatDone
+	r.stopHeartbeat = nil
+}
+
 // requeueDelay — пауза перед возвратом сообщения в очередь.
 // Потребитель один, поэтому RabbitMQ отдаст сообщение обратно немедленно;
 // без паузы повтор попал бы в то же окно недоступности сети.
@@ -390,14 +613,10 @@ const requeueDelay = 60 * time.Second
 
 // processMessage выполняет полный цикл обработки одного сообщения:
 // скачивание входных данных, расчёт AP3DMT, конвертация и загрузка результата в S3.
+// На каждом переходе публикует текущий этап через reporter.
 // Тип возвращаемой ошибки определяет судьбу сообщения в очереди: временная —
 // сообщение возвращается в очередь, permanent — отбрасывается.
-func processMessage(s3Client *s3.Client, body []byte) error {
-	var message QueueMessage
-	if err := json.Unmarshal(body, &message); err != nil {
-		return permanent("failed to unmarshal message JSON: %v", err)
-	}
-
+func processMessage(s3Client *s3.Client, bucketName string, message QueueMessage, reporter *statusReporter) error {
 	if message.S3FileKey == "" {
 		return permanent("message does not contain 's3_file_key'")
 	}
@@ -415,12 +634,7 @@ func processMessage(s3Client *s3.Client, body []byte) error {
 	localFilePath := filepath.Join(downloadDir, localFileName)
 
 	// 6. Скачиваем файл из S3
-	bucketName := os.Getenv("AWS_S3_BUCKET_NAME")
-	if bucketName == "" {
-		// Ошибка конфигурации, а не данных: сообщение должно дожить до исправления переменных
-		return fmt.Errorf("AWS_S3_BUCKET_NAME environment variable is not set, cannot download key: %s", message.S3FileKey)
-	}
-
+	reporter.setStage(stageDownloading, "Загрузка входных данных из хранилища")
 	if err := retryTransient("S3 download", func() error {
 		return downloadFileFromS3(s3Client, bucketName, message.S3FileKey, localFilePath)
 	}); err != nil {
@@ -436,6 +650,7 @@ func processMessage(s3Client *s3.Client, body []byte) error {
 
 	ext := strings.ToLower(filepath.Ext(localFilePath))
 	if ext == ".zip" {
+		reporter.setStage(stageExtracting, "Распаковка архива с входными данными")
 		log.Printf("Detected ZIP archive: %s. Extracting to: %s", localFilePath, downloadDir)
 
 		// Очистка старых файлов перед распаковкой
@@ -490,6 +705,7 @@ func processMessage(s3Client *s3.Client, body []byte) error {
 	}
 
 	// 7. Запустить внешнюю программу AP3DMT
+	reporter.setStage(stageComputing, "Выполняется расчёт AP3DMT")
 	log.Printf("[STAGE] Starting AP3DMT execution for user: %s, solution: %s", message.UserID, message.SolutionID)
 	if err := call_solve(); err != nil {
 		// Расчёт детерминирован по входным данным: повтор сожжёт те же часы CPU с тем же результатом
@@ -498,6 +714,7 @@ func processMessage(s3Client *s3.Client, body []byte) error {
 	log.Printf("[STAGE] AP3DMT execution completed successfully")
 
 	// 8. Запустить Python-скрипт (через venv)
+	reporter.setStage(stageConverting, "Конвертация результатов расчёта")
 	if err := runPythonScript(); err != nil {
 		return permanent("python script execution failed: %v", err)
 	}
@@ -521,6 +738,7 @@ func processMessage(s3Client *s3.Client, body []byte) error {
 	resultS3Key := fmt.Sprintf("users/%s/solutions/%s/results/%s", message.UserID, message.SolutionID, resultFileName)
 
 	// Загружаем zip-архив в S3
+	reporter.setStage(stageUploading, "Загрузка результата в хранилище")
 	if err := retryTransient("S3 upload", func() error {
 		return uploadFileToS3(s3Client, bucketName, resultLocalPath, resultS3Key)
 	}); err != nil {
@@ -528,6 +746,8 @@ func processMessage(s3Client *s3.Client, body []byte) error {
 	}
 
 	log.Printf("Successfully uploaded %s to S3: %s", resultFileName, resultS3Key)
+
+	reporter.complete(resultS3Key)
 
 	// 10. Отправить ссылку в Firebase (заглушка)
 	log.Printf("Would send link for user: %s, solution: %s, vtr_key: %s", message.UserID, message.SolutionID, resultS3Key)
@@ -541,6 +761,10 @@ func main() {
 		log.Fatalf("Failed to initialize S3 client: %v", err)
 	}
 	log.Println("S3 client initialized successfully.")
+
+	// Имя бакета уже проверено в initS3Client, читаем его один раз:
+	// он нужен и для данных решения, и для публикации статуса
+	bucketName := os.Getenv("AWS_S3_BUCKET_NAME")
 
 	rabbitURL := os.Getenv("RABBITMQ_URL")
 	if rabbitURL == "" {
@@ -590,10 +814,35 @@ func main() {
 		for d := range msgs {
 			log.Printf("Received a message: %s", d.Body)
 
-			err := processMessage(s3Client, d.Body)
+			// Разбираем сообщение здесь, а не внутри processMessage: без user_id
+			// и solution_id некуда публиковать статус
+			var message QueueMessage
+			if err := json.Unmarshal(d.Body, &message); err != nil {
+				log.Printf("[QUEUE] Failed to unmarshal message JSON: %v. Body: %s", err, d.Body)
+				if rejErr := d.Reject(false); rejErr != nil {
+					log.Printf("[QUEUE] Failed to reject message: %v", rejErr)
+				}
+				continue
+			}
+			if message.UserID == "" || message.SolutionID == "" {
+				log.Printf("[QUEUE] Message lacks user_id or solution_id, cannot report status. Body: %s", d.Body)
+				if rejErr := d.Reject(false); rejErr != nil {
+					log.Printf("[QUEUE] Failed to reject message: %v", rejErr)
+				}
+				continue
+			}
+
+			reporter := newStatusReporter(s3Client, bucketName, message)
+			// Пульс держим на всё время обработки: самый долгий этап (расчёт)
+			// не публикует ничего сам, и без обновления updated_at основной
+			// сервер не поймёт, жив ли потребитель
+			reporter.startHeartbeat()
+
+			err := processMessage(s3Client, bucketName, message, reporter)
 
 			switch {
 			case err == nil:
+				// Статус completed уже опубликован внутри processMessage
 				if ackErr := d.Ack(false); ackErr != nil {
 					log.Printf("[QUEUE] Failed to ack message: %v", ackErr)
 				}
@@ -602,6 +851,7 @@ func main() {
 				// Повтор даст тот же результат — отбрасываем, чтобы не блокировать очередь
 				log.Printf("[QUEUE] Permanent failure, message discarded: %v", err)
 				log.Printf("[QUEUE] Discarded message body: %s", d.Body)
+				reporter.fail(err, false)
 				if rejErr := d.Reject(false); rejErr != nil {
 					log.Printf("[QUEUE] Failed to reject message: %v", rejErr)
 				}
@@ -610,6 +860,7 @@ func main() {
 				// Сообщение уже возвращалось в очередь и упало снова — не гоняем его по кругу
 				log.Printf("[QUEUE] Transient failure on redelivered message, giving up: %v", err)
 				log.Printf("[QUEUE] Message body (requires manual re-publish): %s", d.Body)
+				reporter.fail(err, false)
 				if rejErr := d.Reject(false); rejErr != nil {
 					log.Printf("[QUEUE] Failed to reject message: %v", rejErr)
 				}
@@ -618,11 +869,14 @@ func main() {
 				// Временный сбой на первой доставке — возвращаем сообщение в очередь
 				log.Printf("[QUEUE] Transient failure: %v", err)
 				log.Printf("[QUEUE] Requeueing message in %s", requeueDelay)
+				reporter.fail(err, true)
 				time.Sleep(requeueDelay)
 				if nackErr := d.Nack(false, true); nackErr != nil {
 					log.Printf("[QUEUE] Failed to nack/requeue message: %v", nackErr)
 				}
 			}
+
+			reporter.stop()
 		}
 	}()
 
