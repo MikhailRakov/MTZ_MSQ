@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -30,6 +32,48 @@ type QueueMessage struct {
 	S3FileKey        string `json:"s3_file_key"`
 	OriginalFilename string `json:"original_filename,omitempty"`
 	Timestamp        int64  `json:"timestamp"`
+}
+
+// permanentError помечает ошибку, которую бессмысленно повторять:
+// повторная обработка того же сообщения завершится точно так же
+// (битый JSON, повреждённый архив, падение расчёта на тех же входных данных).
+// Всё, что не помечено, считается временным (сеть, DNS, S3, диск) и уходит в очередь повторно.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// permanent оборачивает ошибку как неповторяемую
+func permanent(format string, args ...interface{}) error {
+	return &permanentError{err: fmt.Errorf(format, args...)}
+}
+
+// isPermanent сообщает, нужно ли отбросить сообщение вместо повторной постановки в очередь
+func isPermanent(err error) bool {
+	var pe *permanentError
+	return errors.As(err, &pe)
+}
+
+// retryBackoff задаёт паузы между повторами временных операций.
+// Суммарно покрывает ~105 секунд недоступности сети/DNS —
+// заметно больше, чем внутренние ретраи AWS SDK (те укладываются в ~15 секунд).
+var retryBackoff = []time.Duration{15 * time.Second, 30 * time.Second, 60 * time.Second}
+
+// retryTransient повторяет операцию с паузами при ошибке
+func retryTransient(opName string, fn func() error) error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if attempt >= len(retryBackoff) {
+			return fmt.Errorf("%s failed after %d attempts: %w", opName, attempt+1, err)
+		}
+		pause := retryBackoff[attempt]
+		log.Printf("[RETRY] %s failed (attempt %d/%d): %v. Retrying in %s",
+			opName, attempt+1, len(retryBackoff)+1, err, pause)
+		time.Sleep(pause)
+	}
 }
 
 // --- Функции для работы с Firebase (примерная структура) ---
@@ -101,7 +145,12 @@ func downloadFileFromS3(s3Client *s3.Client, bucketName, s3Key, localFilePath st
 		Key:    aws.String(s3Key),
 	}
 
-	result, err := s3Client.GetObject(context.TODO(), input)
+	// Таймаут на всю операцию, включая чтение тела ответа:
+	// без него зависшее соединение блокирует обработчик бесконечно
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	result, err := s3Client.GetObject(ctx, input)
 	if err != nil {
 		return fmt.Errorf("failed to get object from S3: %w", err)
 	}
@@ -141,7 +190,7 @@ func uploadFileToS3(s3Client *s3.Client, bucketName, localFilePath, s3Key string
 	}
 
 	// Создаем контекст с таймаутом 10 минут для больших файлов
-	ctx, cancel := context.WithTimeout(context.Background(), 10*60*1000000000) // 10 минут в наносекундах
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	putObjectInput := &s3.PutObjectInput{
@@ -334,6 +383,158 @@ func unzipToFlatDir(src string, dest string) error {
 	return nil
 }
 
+// requeueDelay — пауза перед возвратом сообщения в очередь.
+// Потребитель один, поэтому RabbitMQ отдаст сообщение обратно немедленно;
+// без паузы повтор попал бы в то же окно недоступности сети.
+const requeueDelay = 60 * time.Second
+
+// processMessage выполняет полный цикл обработки одного сообщения:
+// скачивание входных данных, расчёт AP3DMT, конвертация и загрузка результата в S3.
+// Тип возвращаемой ошибки определяет судьбу сообщения в очереди: временная —
+// сообщение возвращается в очередь, permanent — отбрасывается.
+func processMessage(s3Client *s3.Client, body []byte) error {
+	var message QueueMessage
+	if err := json.Unmarshal(body, &message); err != nil {
+		return permanent("failed to unmarshal message JSON: %v", err)
+	}
+
+	if message.S3FileKey == "" {
+		return permanent("message does not contain 's3_file_key'")
+	}
+
+	localFileName := filepath.Base(message.S3FileKey)
+	if localFileName == "." || localFileName == "/" {
+		return permanent("invalid S3 key format, could not extract filename: %s", message.S3FileKey)
+	}
+
+	// 5. Определяем путь для локального сохранения
+	downloadDir := os.Getenv("APP_DIR")
+	if downloadDir == "" {
+		downloadDir = "/app/AP3DMT_app/application"
+	}
+	localFilePath := filepath.Join(downloadDir, localFileName)
+
+	// 6. Скачиваем файл из S3
+	bucketName := os.Getenv("AWS_S3_BUCKET_NAME")
+	if bucketName == "" {
+		// Ошибка конфигурации, а не данных: сообщение должно дожить до исправления переменных
+		return fmt.Errorf("AWS_S3_BUCKET_NAME environment variable is not set, cannot download key: %s", message.S3FileKey)
+	}
+
+	if err := retryTransient("S3 download", func() error {
+		return downloadFileFromS3(s3Client, bucketName, message.S3FileKey, localFilePath)
+	}); err != nil {
+		return fmt.Errorf("failed to download file from S3 (key: %s): %w", message.S3FileKey, err)
+	}
+
+	log.Printf("Successfully downloaded file: %s", localFilePath)
+
+	// Проверка размера скачанного файла
+	if fileInfo, err := os.Stat(localFilePath); err == nil {
+		log.Printf("[DIAGNOSTICS] Downloaded file size: %d bytes", fileInfo.Size())
+	}
+
+	ext := strings.ToLower(filepath.Ext(localFilePath))
+	if ext == ".zip" {
+		log.Printf("Detected ZIP archive: %s. Extracting to: %s", localFilePath, downloadDir)
+
+		// Очистка старых файлов перед распаковкой
+		log.Printf("[CLEANUP] Removing old files from previous runs")
+		filesToClean := []string{
+			"all_models.zip",
+			"Nlcg Log File.dat",
+			"Output LogFile.dat",
+			"result.vtr",
+			"model.vtm",
+		}
+		for _, fname := range filesToClean {
+			oldPath := filepath.Join(downloadDir, fname)
+			if err := os.Remove(oldPath); err == nil {
+				log.Printf("[CLEANUP] Removed old file: %s", fname)
+			}
+		}
+		// Очистка директории Out_Output
+		outDir := filepath.Join(downloadDir, "Out_Output")
+		if err := os.RemoveAll(outDir); err == nil {
+			log.Printf("[CLEANUP] Removed old output directory: Out_Output")
+		}
+
+		// Распаковываем файлы прямо в downloadDir (AP3DMT_app/application)
+		if err := unzipToFlatDir(localFilePath, downloadDir); err != nil {
+			// Битый архив повторной обработкой не исправить
+			return permanent("failed to unzip file %s: %v", localFilePath, err)
+		}
+		log.Printf("Successfully extracted archive contents to: %s", downloadDir)
+
+		// Список файлов после распаковки
+		extractedFiles, _ := os.ReadDir(downloadDir)
+		log.Printf("[DIAGNOSTICS] Files after extraction (%d total):", len(extractedFiles))
+		for i, f := range extractedFiles {
+			if i < 15 {
+				fInfo, _ := f.Info()
+				size := int64(0)
+				if fInfo != nil {
+					size = fInfo.Size()
+				}
+				log.Printf("  - %s (size: %d bytes)", f.Name(), size)
+			}
+		}
+		if len(extractedFiles) > 15 {
+			log.Printf("  ... and %d more files", len(extractedFiles)-15)
+		}
+
+		// Опционально: удалить архив после распаковки, чтобы не занимать место
+		os.Remove(localFilePath)
+	} else {
+		log.Printf("[INFO] File is not a ZIP archive, extension: %s", ext)
+	}
+
+	// 7. Запустить внешнюю программу AP3DMT
+	log.Printf("[STAGE] Starting AP3DMT execution for user: %s, solution: %s", message.UserID, message.SolutionID)
+	if err := call_solve(); err != nil {
+		// Расчёт детерминирован по входным данным: повтор сожжёт те же часы CPU с тем же результатом
+		return permanent("AP3DMT execution failed for file %s: %v", localFilePath, err)
+	}
+	log.Printf("[STAGE] AP3DMT execution completed successfully")
+
+	// 8. Запустить Python-скрипт (через venv)
+	if err := runPythonScript(); err != nil {
+		return permanent("python script execution failed: %v", err)
+	}
+
+	// 9. Проверить и загрузить результат (all_models.zip) в S3
+	//message.UserID, "_", message.SolutionID,
+	resultFileName := "all_models.zip"
+	resultLocalPath := filepath.Join(downloadDir, resultFileName)
+
+	// Проверяем, что файл действительно создался
+	if _, err := os.Stat(resultLocalPath); os.IsNotExist(err) {
+		// 🔍 Отладка: выводим список файлов в директории, чтобы понять, что создалось
+		files, _ := os.ReadDir(downloadDir)
+		for _, f := range files {
+			log.Printf("  Файл в папке: %s", f.Name())
+		}
+		return permanent("ожидаемый файл %s не найден после выполнения скрипта", resultLocalPath)
+	}
+
+	// Формируем ключ для S3
+	resultS3Key := fmt.Sprintf("users/%s/solutions/%s/results/%s", message.UserID, message.SolutionID, resultFileName)
+
+	// Загружаем zip-архив в S3
+	if err := retryTransient("S3 upload", func() error {
+		return uploadFileToS3(s3Client, bucketName, resultLocalPath, resultS3Key)
+	}); err != nil {
+		return fmt.Errorf("failed to upload result file to S3 (key: %s): %w", resultS3Key, err)
+	}
+
+	log.Printf("Successfully uploaded %s to S3: %s", resultFileName, resultS3Key)
+
+	// 10. Отправить ссылку в Firebase (заглушка)
+	log.Printf("Would send link for user: %s, solution: %s, vtr_key: %s", message.UserID, message.SolutionID, resultS3Key)
+	log.Printf("Successfully processed message and uploaded result: %s", resultS3Key)
+	return nil
+}
+
 func main() {
 	s3Client, err := initS3Client()
 	if err != nil {
@@ -366,10 +567,16 @@ func main() {
 	)
 	failOnError(err, "Failed to declare a queue")
 
+	// Забираем ровно одно сообщение за раз: расчёт длится долго, а при ручном
+	// подтверждении без этого ограничения брокер сразу отдал бы всю очередь
+	// одному потребителю, и при его падении неподтверждённые сообщения зависли бы.
+	err = ch.Qos(1, 0, false)
+	failOnError(err, "Failed to set channel QoS")
+
 	msgs, err := ch.Consume(
 		q.Name,    // queue (используем имя из q)
 		"server1", // consumer
-		true,      // auto-ack
+		false,     // auto-ack выключен: подтверждаем только после успешной обработки
 		false,     // exclusive
 		false,     // no-local
 		false,     // no-wait
@@ -383,149 +590,39 @@ func main() {
 		for d := range msgs {
 			log.Printf("Received a message: %s", d.Body)
 
-			var message QueueMessage
-			if err := json.Unmarshal(d.Body, &message); err != nil {
-				log.Printf("Failed to unmarshal message JSON: %v. Body: %s", err, string(d.Body))
-				continue
-			}
+			err := processMessage(s3Client, d.Body)
 
-			if message.S3FileKey == "" {
-				log.Printf("Message does not contain 's3_file_key'. Skipping. Message: %s", string(d.Body))
-				continue
-			}
-
-			localFileName := filepath.Base(message.S3FileKey)
-			if localFileName == "." || localFileName == "/" {
-				log.Printf("Invalid S3 key format, could not extract filename: %s. Skipping.", message.S3FileKey)
-				continue
-			}
-
-			// 5. Определяем путь для локального сохранения
-			downloadDir := os.Getenv("APP_DIR")
-			if downloadDir == "" {
-				downloadDir = "/app/AP3DMT_app/application"
-			}
-			localFilePath := filepath.Join(downloadDir, localFileName)
-
-			// 6. Скачиваем файл из S3
-			bucketName := os.Getenv("AWS_S3_BUCKET_NAME")
-			if bucketName == "" {
-				log.Printf("AWS_S3_BUCKET_NAME environment variable is not set. Cannot download file with key: %s", message.S3FileKey)
-				continue
-			}
-
-			if err := downloadFileFromS3(s3Client, bucketName, message.S3FileKey, localFilePath); err != nil {
-				log.Printf("Failed to download file from S3 (key: %s): %v", message.S3FileKey, err)
-				continue
-			}
-
-			log.Printf("Successfully downloaded file: %s", localFilePath)
-
-			// Проверка размера скачанного файла
-			if fileInfo, err := os.Stat(localFilePath); err == nil {
-				log.Printf("[DIAGNOSTICS] Downloaded file size: %d bytes", fileInfo.Size())
-			}
-
-			ext := strings.ToLower(filepath.Ext(localFilePath))
-			if ext == ".zip" {
-				log.Printf("Detected ZIP archive: %s. Extracting to: %s", localFilePath, downloadDir)
-
-				// Очистка старых файлов перед распаковкой
-				log.Printf("[CLEANUP] Removing old files from previous runs")
-				filesToClean := []string{
-					"all_models.zip",
-					"Nlcg Log File.dat",
-					"Output LogFile.dat",
-					"result.vtr",
-					"model.vtm",
-				}
-				for _, fname := range filesToClean {
-					oldPath := filepath.Join(downloadDir, fname)
-					if err := os.Remove(oldPath); err == nil {
-						log.Printf("[CLEANUP] Removed old file: %s", fname)
-					}
-				}
-				// Очистка директории Out_Output
-				outDir := filepath.Join(downloadDir, "Out_Output")
-				if err := os.RemoveAll(outDir); err == nil {
-					log.Printf("[CLEANUP] Removed old output directory: Out_Output")
+			switch {
+			case err == nil:
+				if ackErr := d.Ack(false); ackErr != nil {
+					log.Printf("[QUEUE] Failed to ack message: %v", ackErr)
 				}
 
-				// Распаковываем файлы прямо в downloadDir (AP3DMT_app/application)
-				if err := unzipToFlatDir(localFilePath, downloadDir); err != nil {
-					log.Printf("Failed to unzip file %s: %v", localFilePath, err)
-					continue
-				}
-				log.Printf("Successfully extracted archive contents to: %s", downloadDir)
-
-				// Список файлов после распаковки
-				extractedFiles, _ := os.ReadDir(downloadDir)
-				log.Printf("[DIAGNOSTICS] Files after extraction (%d total):", len(extractedFiles))
-				for i, f := range extractedFiles {
-					if i < 15 {
-						fInfo, _ := f.Info()
-						size := int64(0)
-						if fInfo != nil {
-							size = fInfo.Size()
-						}
-						log.Printf("  - %s (size: %d bytes)", f.Name(), size)
-					}
-				}
-				if len(extractedFiles) > 15 {
-					log.Printf("  ... and %d more files", len(extractedFiles)-15)
+			case isPermanent(err):
+				// Повтор даст тот же результат — отбрасываем, чтобы не блокировать очередь
+				log.Printf("[QUEUE] Permanent failure, message discarded: %v", err)
+				log.Printf("[QUEUE] Discarded message body: %s", d.Body)
+				if rejErr := d.Reject(false); rejErr != nil {
+					log.Printf("[QUEUE] Failed to reject message: %v", rejErr)
 				}
 
-				// Опционально: удалить архив после распаковки, чтобы не занимать место
-				os.Remove(localFilePath)
-			} else {
-				log.Printf("[INFO] File is not a ZIP archive, extension: %s", ext)
-			}
-
-			// 7. Запустить внешнюю программу AP3DMT
-			log.Printf("[STAGE] Starting AP3DMT execution for user: %s, solution: %s", message.UserID, message.SolutionID)
-			if err := call_solve(); err != nil {
-				log.Printf("AP3DMT execution failed for file %s. Skipping further processing. Error: %v", localFilePath, err)
-				continue // Пропускаем дальнейшую обработку, если AP3DMT завершился с ошибкой
-			}
-			log.Printf("[STAGE] AP3DMT execution completed successfully")
-
-			// 8. Запустить Python-скрипт (через venv)
-			if err := runPythonScript(); err != nil {
-				log.Printf("Python script execution failed. Error: %v", err)
-				continue
-			}
-
-			// 9. Проверить и загрузить результат (all_models.zip) в S3
-			//message.UserID, "_", message.SolutionID,
-			resultFileName := "all_models.zip"
-			resultLocalPath := filepath.Join(downloadDir, resultFileName)
-
-			// Проверяем, что файл действительно создался
-			if _, err := os.Stat(resultLocalPath); os.IsNotExist(err) {
-				log.Printf("Ожидаемый файл %s не найден после выполнения скрипта!", resultLocalPath)
-
-				// 🔍 Отладка: выводим список файлов в директории, чтобы понять, что создалось
-				files, _ := os.ReadDir(downloadDir)
-				for _, f := range files {
-					log.Printf("  Файл в папке: %s", f.Name())
+			case d.Redelivered:
+				// Сообщение уже возвращалось в очередь и упало снова — не гоняем его по кругу
+				log.Printf("[QUEUE] Transient failure on redelivered message, giving up: %v", err)
+				log.Printf("[QUEUE] Message body (requires manual re-publish): %s", d.Body)
+				if rejErr := d.Reject(false); rejErr != nil {
+					log.Printf("[QUEUE] Failed to reject message: %v", rejErr)
 				}
-				continue
+
+			default:
+				// Временный сбой на первой доставке — возвращаем сообщение в очередь
+				log.Printf("[QUEUE] Transient failure: %v", err)
+				log.Printf("[QUEUE] Requeueing message in %s", requeueDelay)
+				time.Sleep(requeueDelay)
+				if nackErr := d.Nack(false, true); nackErr != nil {
+					log.Printf("[QUEUE] Failed to nack/requeue message: %v", nackErr)
+				}
 			}
-
-			// Формируем ключ для S3
-			resultS3Key := fmt.Sprintf("users/%s/solutions/%s/results/%s", message.UserID, message.SolutionID, resultFileName)
-
-			// Загружаем zip-архив в S3
-			if err := uploadFileToS3(s3Client, bucketName, resultLocalPath, resultS3Key); err != nil {
-				log.Printf("Failed to upload result file to S3 (key: %s): %v", resultS3Key, err)
-				continue
-			}
-
-			log.Printf("Successfully uploaded %s to S3: %s", resultFileName, resultS3Key)
-
-			// 10. Отправить ссылку в Firebase (заглушка)
-			log.Printf("Would send link for user: %s, solution: %s, vtr_key: %s", message.UserID, message.SolutionID, resultS3Key)
-			log.Printf("Successfully processed message and uploaded result: %s", resultS3Key)
 		}
 	}()
 

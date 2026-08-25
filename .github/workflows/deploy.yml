@@ -80,6 +80,8 @@ jobs:
             -v /opt/mtz/application:/app/AP3DMT_app/application \
             -v /opt/mtz/logs:/app/logs \
             --network host \
+            --dns 8.8.8.8 \
+            --dns 77.88.8.8 \
             --restart unless-stopped \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           
