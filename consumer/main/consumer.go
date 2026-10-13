@@ -186,7 +186,7 @@ func uploadFileToS3(s3Client *s3.Client, bucketName, localFilePath, s3Key string
 	}
 	defer file.Close()
 
-	// Получаем размер файла для логирования
+	// Получаем размер файла для логирования s
 	fileInfo, err := file.Stat()
 	if err == nil {
 		log.Printf("[UPLOAD] File size: %.2f MB", float64(fileInfo.Size())/(1024*1024))
