@@ -454,8 +454,12 @@ type SolutionStatus struct {
 	// или показывать пользователю окончательную ошибку
 	WillRetry bool   `json:"will_retry"`
 	ResultKey string `json:"result_key,omitempty"`
-	StartedAt string `json:"started_at"`
-	UpdatedAt string `json:"updated_at"`
+	// ResultVersion — версия запуска (каталог внутри results/): история
+	// решений хранит все запуски, основной сервер связывает статус
+	// с конкретным архивом
+	ResultVersion string `json:"result_version,omitempty"`
+	StartedAt     string `json:"started_at"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 // statusReporter публикует текущий этап обработки в S3.
@@ -565,8 +569,8 @@ func (r *statusReporter) setStage(stage, message string) {
 	r.publish(false)
 }
 
-// complete публикует успешное завершение со ссылкой на результат
-func (r *statusReporter) complete(resultKey string) {
+// complete публикует успешное завершение со ссылкой на результат и его версию
+func (r *statusReporter) complete(resultKey, resultVersion string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -576,6 +580,7 @@ func (r *statusReporter) complete(resultKey string) {
 	r.current.Message = "Расчёт завершён, результат загружен"
 	r.current.Error = ""
 	r.current.ResultKey = resultKey
+	r.current.ResultVersion = resultVersion
 	// Терминальный статус обязан дойти: без него пользователь не увидит
 	// завершение, даже если all_models.zip уже в хранилище
 	r.publish(true)
@@ -695,9 +700,28 @@ func resultExists(s3Client *s3.Client, bucketName, key string) bool {
 	return err == nil
 }
 
-// defaultResultKey — путь результата, используемый processMessage,
+// runVersion — идентификатор версии запуска результата. Формируется из
+// timestamp сообщения: одинаков для исходной доставки и всех редоставлений,
+// поэтому повторная обработка не плодит копии, а история запусков решения
+// хранится в S3 в отдельных каталогах results/<version>/.
+func runVersion(msg QueueMessage) string {
+	ts := msg.Timestamp
+	if ts <= 0 {
+		ts = time.Now().Unix()
+	}
+	return "run-" + time.Unix(ts, 0).UTC().Format("20060102-150405")
+}
+
+// defaultResultKey — путь результата текущего запуска (версионный),
 // на случай если status.json записан без result_key
 func defaultResultKey(msg QueueMessage) string {
+	return fmt.Sprintf("users/%s/solutions/%s/results/%s/all_models.zip", msg.UserID, msg.SolutionID, runVersion(msg))
+}
+
+// legacyResultKey — старый фиксированный путь результата (до введения
+// версионирования): перезаписывался каждым запуском, но мог остаться
+// от прошлых обработок
+func legacyResultKey(msg QueueMessage) string {
 	return fmt.Sprintf("users/%s/solutions/%s/results/all_models.zip", msg.UserID, msg.SolutionID)
 }
 
@@ -738,19 +762,23 @@ func repairCompletedStatus(s3Client *s3.Client, bucketName string, msg QueueMess
 	if msg.Timestamp > 0 {
 		r.current.StartedAt = time.Unix(msg.Timestamp, 0).UTC().Format(time.RFC3339)
 	}
-	r.complete(resultKey) // публикация с настойчивыми повторами
+	r.complete(resultKey, runVersion(msg)) // публикация с настойчивыми повторами
 }
 
 // tryRepairFromResult — если результат загружен после отправки задачи,
 // чинит статус completed и возвращает true (пересчёт не нужен).
+// Проверяет версионный ключ текущего запуска и старый фиксированный
+// (задачи, отправленные до введения версионирования).
 func tryRepairFromResult(s3Client *s3.Client, bucketName string, msg QueueMessage) bool {
-	key := defaultResultKey(msg)
-	if !resultUploadedAfter(s3Client, bucketName, key, msg.Timestamp) {
-		return false
+	for _, key := range []string{defaultResultKey(msg), legacyResultKey(msg)} {
+		if !resultUploadedAfter(s3Client, bucketName, key, msg.Timestamp) {
+			continue
+		}
+		log.Printf("[DEDUPE] Результат %s загружен после отправки задачи, но статус не завершён — восстанавливаю completed", key)
+		repairCompletedStatus(s3Client, bucketName, msg, key)
+		return true
 	}
-	log.Printf("[DEDUPE] Результат %s загружен после отправки задачи, но статус не завершён — восстанавливаю completed", key)
-	repairCompletedStatus(s3Client, bucketName, msg, key)
-	return true
+	return false
 }
 
 // checkDuplicate проверяет status.json ПЕРЕД началом обработки:
@@ -971,8 +999,10 @@ func processMessage(s3Client *s3.Client, bucketName string, message QueueMessage
 		return permanent("ожидаемый файл %s не найден после выполнения скрипта", resultLocalPath)
 	}
 
-	// Формируем ключ для S3
-	resultS3Key := fmt.Sprintf("users/%s/solutions/%s/results/%s", message.UserID, message.SolutionID, resultFileName)
+	// Формируем ключ для S3: результат каждого запуска хранится в отдельном
+	// каталоге results/<version>/ — история версий решения не перезаписывается
+	version := runVersion(message)
+	resultS3Key := fmt.Sprintf("users/%s/solutions/%s/results/%s/%s", message.UserID, message.SolutionID, version, resultFileName)
 
 	// Загружаем zip-архив в S3
 	reporter.setStage(stageUploading, "Загрузка результата в хранилище")
@@ -984,7 +1014,7 @@ func processMessage(s3Client *s3.Client, bucketName string, message QueueMessage
 
 	log.Printf("Successfully uploaded %s to S3: %s", resultFileName, resultS3Key)
 
-	reporter.complete(resultS3Key)
+	reporter.complete(resultS3Key, version)
 
 	// 10. Отправить ссылку в Firebase (заглушка)
 	log.Printf("Would send link for user: %s, solution: %s, vtr_key: %s", message.UserID, message.SolutionID, resultS3Key)
