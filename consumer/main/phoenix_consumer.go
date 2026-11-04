@@ -103,10 +103,10 @@ func processPhoenixMessage(s3Client *s3.Client, bucketName string, msg PhoenixMe
 	defer cancel()
 
 	err = ch.PublishWithContext(ctx,
-		"",                    // exchange (default)
-		"calculation_tasks",   // routing key = queue name
-		false,                 // mandatory
-		false,                 // immediate
+		"",                  // exchange (default)
+		"calculation_tasks", // routing key = queue name
+		false,               // mandatory
+		false,               // immediate
 		amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,

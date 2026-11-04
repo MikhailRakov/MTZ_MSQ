@@ -85,5 +85,5 @@ jobs:
             --restart unless-stopped \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           
-          echo "✅ Деплой завершён!"
+          echo " Деплой завершён!"
           docker ps | grep mtz-consumer
