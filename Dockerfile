@@ -4,7 +4,7 @@ WORKDIR /app
 COPY consumer/go.mod consumer/go.sum ./
 RUN go mod download
 COPY consumer/ ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o consumer ./main/consumer.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o consumer ./main/
 
 FROM ubuntu:22.04
 
