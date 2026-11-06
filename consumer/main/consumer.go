@@ -1206,24 +1206,6 @@ func main() {
 	const maxReconnectPause = 60 * time.Second
 	reconnectPause := 5 * time.Second
 
-	// Запускаем Phoenix consumer в отдельной горутине с собственным циклом переподключения
-	go func() {
-		phoenixPause := 5 * time.Second
-		for {
-			started := time.Now()
-			err := consumePhoenixLoop(s3Client, bucketName, rabbitURL)
-			log.Printf("[PHOENIX] Consumer stopped: %v", err)
-			if time.Since(started) > time.Minute {
-				phoenixPause = 5 * time.Second
-			}
-			log.Printf("[PHOENIX] Reconnecting in %s", phoenixPause)
-			time.Sleep(phoenixPause)
-			if phoenixPause < maxReconnectPause {
-				phoenixPause *= 2
-			}
-		}
-	}()
-
 	// Основной consumer loop для calculation_tasks
 	for {
 		started := time.Now()
